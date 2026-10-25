@@ -3,8 +3,19 @@
 티켓 예매 서비스의 백엔드 세 개를 만든다: **예약 서버**, **대기열 서버**, **모의 결제사(mock-pg)**.
 티켓 오픈 때의 흐름 **대기열 → 좌석 선점(여러 장·연석) → 결제(카드 2단계 / 입금 대기) → 확정**, 그리고 **취소표**를 다룬다.
 
-- 기술: Java 21, Spring Boot 4, Gradle 멀티 모듈. 예약 서버만 PostgreSQL 17을 쓰고, DB는 Docker Compose로 띄운다.
-- 이 문서만 보고 구현할 수 있는 수준을 목표로 한다. 이 문서에 없는 동작은 정해진 것이 없다.
+### 기술 스택
+| 항목 | 선택 |
+|---|---|
+| 언어 / 런타임 | Java 21 |
+| 프레임워크 | Spring Boot 4.1.2 |
+| 빌드 | Gradle (Wrapper 사용), 멀티 모듈 `server`, `queue`, `mock-pg` |
+| 공통 의존성 (세 모듈) | Spring Web, Validation, Actuator (`/actuator/health`로 기동 확인) |
+| 예약 서버 DB | PostgreSQL 17 (Docker Compose로 실행) |
+| 예약 서버 DB 접근 | JdbcTemplate. JPA는 쓰지 않는다 |
+| 스키마 마이그레이션 | Flyway |
+| 예약 서버 테스트의 DB | Testcontainers (PostgreSQL) |
+| 그외 | Lombok |
+| 쓰지 않는 것 | Spring Boot Docker Compose 지원, Spring Security |
 
 ---
 
