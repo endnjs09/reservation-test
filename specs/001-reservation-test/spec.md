@@ -1,240 +1,240 @@
-# reservation-test 명세
+# reservation-test Specification
 
-티켓 예매 서비스의 백엔드 세 개를 만든다: **예약 서버**, **대기열 서버**, **모의 결제사(mock-pg)**.
-티켓 오픈 때의 흐름 **대기열 → 좌석 선점(여러 장·연석) → 결제(카드 2단계 / 입금 대기) → 확정**, 그리고 **취소표**를 다룬다.
+Build three backend services for a ticket booking service: a **reservation server**, a **queue server**, and a **mock payment gateway (mock-pg)**.
+They cover the ticket-opening flow **queue → seat hold (multiple seats, adjacent seats) → payment (two-step card / pending deposit) → confirmation**, plus **returned tickets**.
 
-### 기술 스택
-| 항목 | 선택 |
+### Tech stack
+| Item | Choice |
 |---|---|
-| 언어 / 런타임 | Java 21 |
-| 프레임워크 | Spring Boot 4.1.2 |
-| 빌드 | Gradle (Wrapper 사용), 멀티 모듈 `server`, `queue`, `mock-pg` |
-| 공통 의존성 (세 모듈) | Spring Web, Validation, Actuator (`/actuator/health`로 기동 확인) |
-| 예약 서버 DB | PostgreSQL 17 (Docker Compose로 실행) |
-| 예약 서버 DB 접근 | JdbcTemplate. JPA는 쓰지 않는다 |
-| 스키마 마이그레이션 | Flyway |
-| 예약 서버 테스트의 DB | Testcontainers (PostgreSQL) |
-| 그외 | Lombok |
-| 쓰지 않는 것 | Spring Boot Docker Compose 지원, Spring Security |
+| Language / runtime | Java 21 |
+| Framework | Spring Boot 4.1.2 |
+| Build | Gradle (using the Wrapper), multi-module: `server`, `queue`, `mock-pg` |
+| Common dependencies (all three modules) | Spring Web, Validation, Actuator (startup check via `/actuator/health`) |
+| Reservation server DB | PostgreSQL 17 (run with Docker Compose) |
+| Reservation server DB access | JdbcTemplate. Do not use JPA |
+| Schema migration | Flyway |
+| DB for reservation server tests | Testcontainers (PostgreSQL) |
+| Other | Lombok |
+| Not used | Spring Boot Docker Compose support, Spring Security |
 
 ---
 
-## 1. 범위와 원칙
+## 1. Scope and principles
 
-- 정확성: 9장의 불변식을 항상(또는 명시된 시점에) 만족해야 한다.
-- 범위 밖: 인증·인가, 실제 결제, 배포. 사용자는 `userId` 문자열로만 구분한다.
-- 좌석 수, 정원, TTL, 실패율 등 모든 수치는 설정값이다. 대부분은 `/admin/reset`으로 실행 중에 바꿀 수 있다 (커넥션 풀 크기처럼 재시작이 필요한 값은 제외).
-- 세 서버는 서로의 코드에 의존하지 않는다. HTTP로만 통신한다.
-- 10장 "구현하지 말 것"은 구현하지 않는다.
+- Correctness: the invariants in section 9 must hold at all times (or at the times stated).
+- Out of scope: authentication and authorization, real payments, deployment. Users are identified only by a `userId` string.
+- Every number (seat count, capacity, TTLs, failure rates, etc.) is a setting. Most can be changed at runtime through `/admin/reset` (except values that need a restart, such as the connection pool size).
+- The three services do not depend on each other's code. They communicate only over HTTP.
+- Do not implement anything in section 10, "Do not implement".
 
 ---
 
-## 2. 구조
+## 2. Structure
 
-### 2.1 모듈과 포트
+### 2.1 Modules and ports
 ```
 reservation-test/
 ├── settings.gradle          # include 'server', 'queue', 'mock-pg'
-├── build.gradle             # 공통 (Java 21)
+├── build.gradle             # common (Java 21)
 ├── docker-compose.yml       # postgres:17
-├── server/    :8080  예약 서버
-├── queue/     :8082  대기열 서버   (DB 없음, 메모리 기반 단일 인스턴스)
-└── mock-pg/   :8081  모의 결제사   (DB 없음, 메모리 기반)
+├── server/    :8080  reservation server
+├── queue/     :8082  queue server        (no DB, in-memory, single instance)
+└── mock-pg/   :8081  mock payment gateway (no DB, in-memory)
 ```
-- 실행 순서: `docker compose up -d` → mock-pg → queue → server.
-- DB 이름 `reservation`. 접속 정보는 `docker-compose.yml`과 예약 서버 설정에 같은 값으로 둔다.
+- Start order: `docker compose up -d` → mock-pg → queue → server.
+- The DB name is `reservation`. Use the same connection settings in `docker-compose.yml` and in the reservation server configuration.
 
-### 2.2 요청 경로
+### 2.2 Request paths
 ```
-사용자 ──① 진입·순번 조회──▶ 대기열 서버          순번, 입장키 발급
-   │◀──────── 입장키 ──────────┘
-   │
-   ├──② 입장키 + 요청─────▶ 예약 서버 ──▶ DB        입장키 서명·만료만 검사 (대기열 서버 호출 없음)
-   │                          ├──▶ 대기열 서버       자리 상태 알림 (선점 중 / 해제 / 완료)
-   │                          └──▶ 결제사            승인·조회·취소 요청
-   │
-   └──③ 카드 인증──────────▶ 결제사                사용자가 직접
+User ──① enter / poll position──▶ Queue server          position, admission key issued
+  │◀────────── admission key ─────────┘
+  │
+  ├──② admission key + request──▶ Reservation server ──▶ DB     checks only the key's signature and expiry (no call to the queue server)
+  │                                 ├──▶ Queue server            slot status notifications (holding / cleared / completed)
+  │                                 └──▶ Payment gateway         approve, query, cancel
+  │
+  └──③ card authorization──────▶ Payment gateway               called by the user directly
 ```
-- 대기 중인 사용자의 순번 조회는 예약 서버에 **한 건도 닿지 않는다**.
-- 입장 이후 요청은 사용자 → 예약 서버로 직접 간다. 예약 서버는 요청마다 대기열 서버를 부르지 않는다.
+- Position polling by waiting users **never reaches** the reservation server.
+- After admission, requests go directly from the user to the reservation server. The reservation server does not call the queue server per request.
 
 ---
 
-## 3. 시간
+## 3. Time
 
-### 3.1 서버 시계
-- 세 서버는 각자 하나의 **서버 시계**를 가진다. 동작 판단에 쓰는 "현재 시각"은 전부 이 시계에서 얻는다. 시스템 벽시계를 직접 읽지 않고, DB 쿼리의 시각 비교에도 DB의 현재 시각 함수 대신 서버 시계 값을 넘긴다.
-- 서버 시계 = `기준 시각 + 기준을 잡은 뒤의 단조 경과 + 이동량`.
-  - 기동 직후: 기준 시각 = 기동 시점의 시스템 시각, 이동량 0.
-  - `/admin/reset`에 `anchorAt`이 오면: 기준 시각 = `anchorAt`, 단조 경과는 reset 요청을 받은 순간부터 다시 센다, 이동량 0.
-  - `anchorAt` 없이 reset하면: 기준 시각 = 그 순간의 시스템 시각, 이동량 0.
-  - 시계 이동 API(3.2)를 부르면 이동량에 더한다.
-- 단조 경과를 쓰므로 시스템 벽시계가 바뀌어도 서버 시계는 영향받지 않는다.
+### 3.1 Server clock
+- Each of the three services has one **server clock**. Every "current time" used for behavior decisions comes from this clock. Do not read the system wall clock directly, and in DB queries pass the server clock value instead of using the DB's current-time functions for time comparisons.
+- Server clock = `base time + monotonic time elapsed since the base was set + offset`.
+  - Right after startup: base time = system time at startup, offset 0.
+  - When `/admin/reset` includes `anchorAt`: base time = `anchorAt`, monotonic elapsed time restarts from the moment the reset request is received, offset 0.
+  - Reset without `anchorAt`: base time = system time at that moment, offset 0.
+  - Calling the clock advance API (3.2) adds to the offset.
+- Because monotonic elapsed time is used, changes to the system wall clock do not affect the server clock.
 
-### 3.2 시계 API (세 서버 공통)
+### 3.2 Clock API (all three services)
 - **`GET /admin/clock`** → 200 `{ "now" }`
-- **`POST /admin/clock/advance`** `{ "seconds": 30 }` → 서버 시계를 그만큼 앞으로 옮긴다. `seconds`는 0보다 큰 수(소수 허용). 0 이하·누락은 400 `VALIDATION_FAILED`. 200 `{ "now" }`.
-  - 시계를 뒤로 돌리는 API는 없다.
-  - 옮긴 뒤의 판단(만료·기한·판매 종료 등)은 요청 처리 때와 각 스케줄러의 다음 주기에 반영된다.
-- 세 서버의 시계는 서로 독립이다. 세 서버를 같은 시각으로 맞추려면 호출하는 쪽이 세 서버에 같은 `anchorAt`·같은 이동량을 보낸다.
+- **`POST /admin/clock/advance`** `{ "seconds": 30 }` → moves the server clock forward by that amount. `seconds` must be greater than 0 (decimals allowed). 0 or less, or missing → 400 `VALIDATION_FAILED`. 200 `{ "now" }`.
+  - There is no API to move the clock backward.
+  - Decisions after moving the clock (expiry, deadlines, sale end, etc.) take effect when requests are processed and on each scheduler's next run.
+- The three clocks are independent. To keep the three services at the same time, the caller sends the same `anchorAt` and the same advance amounts to all three.
 
-### 3.3 서버 시계를 쓰지 않는 것
-아래는 실제 시간(단조 시계)으로 동작한다. 시계 이동의 영향을 받지 않는다.
-- 스케줄러 주기
-- 결제사 승인 지연과 타임아웃 대기, 예약 서버의 결제사 호출 타임아웃
-- 대기열 서버로의 알림 재시도 간격 (6.11)
+### 3.3 Things that do not use the server clock
+These run on real (monotonic) time and are not affected by moving the clock:
+- scheduler intervals
+- payment gateway approval delay and timeout hold, and the reservation server's timeouts for payment gateway calls
+- retry intervals for notifications to the queue server (6.11)
 
-### 3.4 표기
-- 설정의 시간 길이 값(`...Sec`)은 서버 시계 기준 초다.
-- API의 시각은 ISO-8601 UTC 문자열이다.
+### 3.4 Notation
+- Duration settings (`...Sec`) are seconds of server clock time.
+- Times in the API are ISO-8601 UTC strings.
 
 ---
 
-## 4. 도메인
+## 4. Domain
 
-### 4.1 좌석과 등급
-- 행 `A`부터 `rows`개, 열 `1`부터 `cols`개. 기본 10 × 10 = 100석.
-- 좌석 `id = 행 인덱스 × cols + 열 인덱스 + 1` (행·열 인덱스는 0부터), `label`은 `"A1"` 형식.
-- 등급은 앞줄부터 행 단위로 정한다. 설정 `grades: [{ name, rows, price }]`, 행 수의 합은 `rows`와 같아야 한다.
-- 등급 이름은 `VIP`, `S`, `A`, `B` 중에서 쓴다.
+### 4.1 Seats and grades
+- `rows` rows starting at `A`, `cols` columns starting at `1`. Default 10 × 10 = 100 seats.
+- Seat `id = row index × cols + column index + 1` (row and column indexes start at 0); `label` has the form `"A1"`.
+- Grades are assigned by rows, starting from the front row. Setting `grades: [{ name, rows, price }]`; the sum of `rows` must equal `rows`.
+- Grade names are chosen from `VIP`, `S`, `A`, `B`.
 
-| 등급 | 행 수 | 기본 행 | 좌석 | 가격 |
+| Grade | Rows | Default rows | Seats | Price |
 |---|---|---|---|---|
 | VIP | 1 | A | 10 | 150000 |
-| S | 2 | B~C | 20 | 120000 |
-| A | 3 | D~F | 30 | 90000 |
-| B | 4 | G~J | 40 | 60000 |
+| S | 2 | B–C | 20 | 120000 |
+| A | 3 | D–F | 30 | 90000 |
+| B | 4 | G–J | 40 | 60000 |
 
-### 4.2 상태값
-| 대상 | 값 |
+### 4.2 Status values
+| Entity | Values |
 |---|---|
-| 좌석 | `AVAILABLE`, `HELD`, `PENDING_DEPOSIT`, `RETURN_PENDING`, `SOLD` |
-| 예약 | `HELD`, `CONFIRMING`, `CONFIRMED`, `EXPIRED`, `RELEASED`, `PAYMENT_FAILED`, `PENDING_DEPOSIT`, `DEPOSIT_EXPIRED`, `CANCELED` |
-| 결제 (예약 서버) | `REQUESTED`, `APPROVED`, `FAILED`, `CANCELED` |
-| 대기 토큰 (대기열 서버) | `WAITING`, `ADMITTED`, `COMPLETED`, `LEFT`, `EXPIRED`, `CLOSED` |
+| Seat | `AVAILABLE`, `HELD`, `PENDING_DEPOSIT`, `RETURN_PENDING`, `SOLD` |
+| Reservation | `HELD`, `CONFIRMING`, `CONFIRMED`, `EXPIRED`, `RELEASED`, `PAYMENT_FAILED`, `PENDING_DEPOSIT`, `DEPOSIT_EXPIRED`, `CANCELED` |
+| Payment (reservation server) | `REQUESTED`, `APPROVED`, `FAILED`, `CANCELED` |
+| Queue token (queue server) | `WAITING`, `ADMITTED`, `COMPLETED`, `LEFT`, `EXPIRED`, `CLOSED` |
 
-- 좌석 `HELD`는 그 좌석을 가진 예약이 `HELD` 또는 `CONFIRMING`인 동안 유지된다.
-- 한 예약은 좌석 1~`maxSeatsPerUser`개를 가진다. 한 예약의 좌석은 **항상 같은 상태**다 (일부만 선점·일부만 반환하는 일은 없다).
+- A seat stays `HELD` while the reservation that owns it is `HELD` or `CONFIRMING`.
+- A reservation has 1 to `maxSeatsPerUser` seats. All seats of one reservation are **always in the same state** (never partially held or partially returned).
 
-### 4.3 예약 상태 전이
-| 현재 | 사건 | 조건 | 다음 | 좌석·부수 효과 |
+### 4.3 Reservation state transitions
+| Current | Event | Condition | Next | Seat and side effects |
 |---|---|---|---|---|
-| (없음) | 선점 성공 | 요청한 좌석 전부 확보 | HELD | 좌석 → HELD |
-| HELD | 선점 해제 | - | RELEASED | 좌석 즉시 반환 |
-| HELD | 만료 스케줄러 | now ≥ 선점 만료 시각 | EXPIRED | 좌석 즉시 반환 |
-| HELD | 승인 요청 | 6.6의 확인 통과 | CONFIRMING | 승인 기한 = now + `confirmDeadlineSec` |
-| HELD | 승인 요청 | 만료 시각 지남 | (유지) | 409 `RESERVATION_NOT_PAYABLE`, 결제사 호출 없음 |
-| HELD | 입금 대기 선택 | 만료 전 | PENDING_DEPOSIT | 좌석 → PENDING_DEPOSIT, 대기열 자리 COMPLETED 알림 |
-| CONFIRMING | 결제사 승인 성공 (요청 안에서든 복구에서든) | - | CONFIRMED | 결제 APPROVED, 좌석 → SOLD, COMPLETED 알림 |
-| CONFIRMING | 승인 거절 / 복구에서 취소 확정 | - | PAYMENT_FAILED | 결제 FAILED 또는 CANCELED, 좌석 즉시 반환 |
-| PENDING_DEPOSIT | 입금 | 기한 전, 금액 일치 | CONFIRMED | 좌석 → SOLD |
-| PENDING_DEPOSIT | 입금 마감 스케줄러 | now ≥ 입금 기한 | DEPOSIT_EXPIRED | 좌석 → RETURN_PENDING (취소표 배치에 들어감) |
-| PENDING_DEPOSIT | 사용자 취소 | - | CANCELED | 좌석 즉시 반환 |
-| CONFIRMED | 사용자 취소 | 카드면 결제사 취소 성공 | CANCELED | 좌석 즉시 반환 |
-| (좌석) RETURN_PENDING | 취소표 오픈 | 배치 오픈 시각 도달 | - | 좌석 → AVAILABLE (배치 단위로 한꺼번에) |
-| 그 외 | 모든 사건 | - | 유지 | 기록만 |
+| (none) | Hold succeeds | All requested seats acquired | HELD | Seats → HELD |
+| HELD | Hold released | - | RELEASED | Seats returned immediately |
+| HELD | Expiry scheduler | now ≥ hold expiry time | EXPIRED | Seats returned immediately |
+| HELD | Approval request | Passes the checks in 6.6 | CONFIRMING | Approval deadline = now + `confirmDeadlineSec` |
+| HELD | Approval request | Hold expiry time has passed | (unchanged) | 409 `RESERVATION_NOT_PAYABLE`, no payment gateway call |
+| HELD | Choose pending deposit | Before expiry | PENDING_DEPOSIT | Seats → PENDING_DEPOSIT, COMPLETED notification for the queue slot |
+| CONFIRMING | Payment gateway approval succeeds (in the request or in recovery) | - | CONFIRMED | Payment APPROVED, seats → SOLD, COMPLETED notification |
+| CONFIRMING | Approval declined / cancellation confirmed in recovery | - | PAYMENT_FAILED | Payment FAILED or CANCELED, seats returned immediately |
+| PENDING_DEPOSIT | Deposit | Before the deadline, amount matches | CONFIRMED | Seats → SOLD |
+| PENDING_DEPOSIT | Deposit deadline scheduler | now ≥ deposit deadline | DEPOSIT_EXPIRED | Seats → RETURN_PENDING (added to a return batch) |
+| PENDING_DEPOSIT | User cancels | - | CANCELED | Seats returned immediately |
+| CONFIRMED | User cancels | For card: payment gateway cancellation succeeds | CANCELED | Seats returned immediately |
+| (seat) RETURN_PENDING | Return batch opens | Batch open time reached | - | Seats → AVAILABLE (all seats of the batch together) |
+| Any other | Any event | - | unchanged | Log only |
 
-- **CONFIRMING 예약은 만료 스케줄러가 건드리지 않는다.** 승인 기한이 지나도 CONFIRMING으로 남고, 복구 스케줄러(6.6)가 결론을 낸다.
-- **좌석 반환은 항상 조건부다**: 그 좌석의 현재 소유 예약이 반환하려는 예약일 때만 좌석을 되돌린다. 예약이 끝날 때 그 예약의 좌석 배정 행에 해제 시각(`released_at`)을 기록한다.
-- "즉시 반환"은 좌석을 `AVAILABLE`로 되돌리고 현재 소유 예약을 비우는 것이다.
+- **The expiry scheduler never touches CONFIRMING reservations.** They stay CONFIRMING after the approval deadline passes, and the recovery scheduler (6.6) resolves them.
+- **Returning seats is always conditional**: a seat is returned only when its current owning reservation is the reservation being returned. When a reservation ends, record the release time (`released_at`) on that reservation's seat assignment rows.
+- "Returned immediately" means the seat goes back to `AVAILABLE` and its current owning reservation is cleared.
 
-### 4.4 좌석이 돌아오는 경로
-| 경로 | 방식 |
+### 4.4 How seats come back
+| Path | How |
 |---|---|
-| 선점 만료, 선점 해제, 카드 결제 실패(거절·망취소), 판매 종료로 인한 선점 만료 | 즉시 |
-| 사용자 예매 취소 (CONFIRMED, PENDING_DEPOSIT) | 즉시 |
-| 입금 대기 미입금 | 반환 대기 → **배치로 한꺼번에** (6.8) |
+| Hold expiry, hold release, card payment failure (declined or reversed), hold expiry due to sale end | Immediately |
+| User cancels a booking (CONFIRMED, PENDING_DEPOSIT) | Immediately |
+| Pending deposit not paid | Return pending → **released together as a batch** (6.8) |
 
-### 4.5 정책
-| 항목 | 정책 |
+### 4.5 Policies
+| Item | Policy |
 |---|---|
-| 선점 유효시간 | `holdTtlSec` 기본 420 |
-| 1인 1선점 | 사용자당 HELD 또는 CONFIRMING 예약 최대 1건 |
-| 1인 1예매 | CONFIRMED 또는 PENDING_DEPOSIT 예약이 있으면 새 선점 불가 (409 `USER_ALREADY_PURCHASED`). 한 예매 최대 `maxSeatsPerUser`(기본 4)매 |
-| 결제 주문 | 예약당 결제 1건. checkout을 다시 요청하면 기존 주문을 그대로 돌려준다 |
-| 승인 직전 확인 | 예약이 HELD이고, 만료 전이고, 사용자·금액이 일치할 때만 결제사 승인을 호출한다 |
-| 승인 결과 불명 | 결제사에 상태 조회 1회 → 그래도 불명이면 CONFIRMING 유지, 복구 스케줄러가 처리 |
-| 선점 재요청 | `Idempotency-Key`로 멱등. 같은 키 + 같은 내용 → 처음과 같은 응답, 같은 키 + 다른 내용 → 422 |
+| Hold lifetime | `holdTtlSec`, default 420 |
+| One hold per user | At most one HELD or CONFIRMING reservation per user |
+| One booking per user | A user with a CONFIRMED or PENDING_DEPOSIT reservation cannot make a new hold (409 `USER_ALREADY_PURCHASED`). At most `maxSeatsPerUser` (default 4) seats per booking |
+| Payment order | One payment per reservation. A repeated checkout returns the existing order |
+| Check before approval | Call payment gateway approval only when the reservation is HELD, not expired, and user and amount match |
+| Unknown approval result | Query the payment gateway once → if still unknown, keep CONFIRMING; the recovery scheduler handles it |
+| Repeated hold requests | Idempotent by `Idempotency-Key`. Same key + same content → same response as the first; same key + different content → 422 |
 
 ---
 
-## 5. 데이터 (예약 서버)
+## 5. Data (reservation server)
 
-### 5.1 테이블
-스키마 마이그레이션 도구를 쓰고, 최종 스키마는 아래와 같다. 컬럼 이름은 `/admin/snapshot`(6.14)에 그대로 드러난다.
+### 5.1 Tables
+Use a schema migration tool. The final schema is below. Column names appear as-is in `/admin/snapshot` (6.14).
 
 **seats**
-| 컬럼 | 설명 |
+| Column | Description |
 |---|---|
-| `id` | 좌석 id (4.1의 공식), PK |
-| `label` | `"A1"`, 유일 |
-| `row_index`, `col_index` | 0부터 |
-| `grade`, `price` | 등급, 가격 |
-| `status` | 4.2의 좌석 상태 5개만 허용 |
-| `current_reservation_id` | 좌석을 지금 가진 예약. 없으면 null |
-| `release_batch_id` | RETURN_PENDING일 때 속한 취소표 배치. 아니면 null |
-| `version` | 좌석이 바뀔 때마다 1 증가 (기본 0) |
+| `id` | Seat id (formula in 4.1), PK |
+| `label` | `"A1"`, unique |
+| `row_index`, `col_index` | Start at 0 |
+| `grade`, `price` | Grade, price |
+| `status` | Only the 5 seat states in 4.2 |
+| `current_reservation_id` | Reservation that currently owns the seat. Null if none |
+| `release_batch_id` | Return batch the seat belongs to while RETURN_PENDING. Otherwise null |
+| `version` | Incremented by 1 on every change (default 0) |
 | `updated_at` | |
 
 **reservations**
-| 컬럼 | 설명 |
+| Column | Description |
 |---|---|
-| `id` | PK, 증가 |
-| `seat_id` | 대표 좌석 (예약 좌석 중 가장 작은 id) |
+| `id` | PK, auto-increment |
+| `seat_id` | Representative seat (smallest seat id in the reservation) |
 | `user_id` | |
-| `status` | 4.2의 예약 상태 9개만 허용 |
-| `seat_count` | 좌석 수 |
-| `payment_method` | `CARD` 또는 `DEPOSIT`, 정해지기 전에는 null |
-| `hold_expires_at`, `confirm_deadline`, `deposit_deadline` | 선점 만료 시각, 승인 기한, 입금 기한 |
-| `idempotency_key` | 유일 |
-| `admission_kid` | 선점할 때 쓴 입장키의 `kid`. 입장키 검사를 끈 경우 null |
+| `status` | Only the 9 reservation states in 4.2 |
+| `seat_count` | Number of seats |
+| `payment_method` | `CARD` or `DEPOSIT`; null until decided |
+| `hold_expires_at`, `confirm_deadline`, `deposit_deadline` | Hold expiry time, approval deadline, deposit deadline |
+| `idempotency_key` | Unique |
+| `admission_kid` | `kid` of the admission key used for the hold. Null when admission key checks are disabled |
 | `created_at`, `updated_at` | |
 
-**reservation_seats** (예약의 좌석 목록. **좌석 목록의 기준은 이 테이블**이고 `reservations.seat_id`는 대표 좌석일 뿐이다)
-| 컬럼 | 설명 |
+**reservation_seats** (seat list of a reservation. **This table is the source of truth for a reservation's seats**; `reservations.seat_id` is only the representative seat)
+| Column | Description |
 |---|---|
-| `reservation_id`, `seat_id` | 함께 PK |
-| `released_at` | 예약이 끝나 좌석을 놓은 시각. 아직 가지고 있으면 null |
+| `reservation_id`, `seat_id` | Composite PK |
+| `released_at` | Time the reservation ended and let go of the seat. Null while it still holds it |
 
 **payments**
-| 컬럼 | 설명 |
+| Column | Description |
 |---|---|
-| `id` | UUID, PK. 주문 번호(`orderId`)로 쓴다 |
-| `reservation_id` | 유일 (예약당 결제 1건) |
-| `amount` | 좌석 가격 합 |
-| `status` | 4.2의 결제 상태 4개만 허용 |
-| `payment_key` | 결제사가 발급한 키 |
+| `id` | UUID, PK. Used as the order id (`orderId`) |
+| `reservation_id` | Unique (one payment per reservation) |
+| `amount` | Sum of seat prices |
+| `status` | Only the 4 payment states in 4.2 |
+| `payment_key` | Key issued by the payment gateway |
 | `fail_reason` | |
 | `created_at`, `updated_at` | |
 
-**release_batches** (취소표 배치)
-| 컬럼 | 설명 |
+**release_batches** (return batches)
+| Column | Description |
 |---|---|
-| `id` | PK, 증가 |
-| `release_at` | 오픈 예정 시각 |
-| `released` | 오픈(또는 판매 종료로 정리)됐는지. 기본 false |
-| `released_at` | 실제로 오픈한 시각 |
-| `seat_count` | 배치에 들어온 좌석 수. 기본 0 |
+| `id` | PK, auto-increment |
+| `release_at` | Scheduled open time |
+| `released` | Whether opened (or cleaned up by sale end). Default false |
+| `released_at` | Actual open time |
+| `seat_count` | Number of seats added to the batch. Default 0 |
 
-- **열린 배치(`released = false`)는 동시에 최대 1개**다.
-- 판매 기간(시작 시각, 종료 시각, 종료 처리를 마쳤는지)도 DB에 저장해서, 예약 서버를 재시작해도 판매 종료 시각이 유지되게 한다 (`/admin/reset` 전까지).
+- **At most one batch is open (`released = false`) at any time.**
+- The sale period (start time, end time, whether end processing is done) is also stored in the DB, so the sale end time survives a reservation server restart (until `/admin/reset`).
 
-### 5.2 DB 보호 제약 (backstop)
-설정 `dbBackstop`이 true면 DB에 아래 두 유일 제약을 두고, false면 없앤다. 서버 시작 때와 `/admin/reset` 때 설정에 맞춘다.
-- 좌석당 `released_at`이 null인 `reservation_seats` 행은 최대 1개
-- 사용자당 HELD 또는 CONFIRMING 예약은 최대 1개
+### 5.2 DB protection constraints (backstop)
+When the setting `dbBackstop` is true, the DB has the two uniqueness constraints below; when false, they are removed. Apply the setting at server startup and on `/admin/reset`.
+- At most one `reservation_seats` row with `released_at` null per seat
+- At most one HELD or CONFIRMING reservation per user
 
-제약 위반은 각각 409 `SEAT_UNAVAILABLE`, 409 `USER_ALREADY_HOLDING`으로 바꿔 응답한다.
-`naive` 전략(6.5) + backstop false 조합에서는 같은 좌석이 동시에 여러 예약에 배정될 수 있다. 이 조합은 **보호 장치가 없을 때의 동작을 확인하기 위한 비교용**이다. 그 외 조합에서는 일어나면 안 된다.
+Violations are returned as 409 `SEAT_UNAVAILABLE` and 409 `USER_ALREADY_HOLDING` respectively.
+With the `naive` strategy (6.5) and backstop false, the same seat can be assigned to several reservations at once. This combination exists **for comparison, to observe behavior without protection**. It must not happen with any other combination.
 
-### 5.3 커넥션 풀
-- DB 커넥션 풀 최대 크기 기본 20. 설정 파일 값이며, 바꾸려면 재시작이 필요하다.
+### 5.3 Connection pool
+- DB connection pool maximum size, default 20. A configuration file value; changing it requires a restart.
 
 ---
 
-## 6. 예약 서버 (:8080)
+## 6. Reservation server (:8080)
 
-### 6.1 설정
+### 6.1 Configuration
 ```yaml
 server.port: 8080
 reservation:
@@ -253,58 +253,58 @@ reservation:
                reopen-interval-ms: 1000, expiry-batch-size: 500 }
   pg: { base-url: http://localhost:8081, connect-timeout-ms: 1000, request-timeout-ms: 3000 }
 admission:
-  required: true                 # false면 입장키 검사(6.3)를 하지 않는다
-  key-secret: dev-only-change-me # 대기열 서버와 같은 값
-queue-server.base-url: http://localhost:8082   # 자리 상태 알림(6.11) 대상
-internal.secret: dev-internal-secret            # 대기열 서버와 같은 값
+  required: true                 # if false, admission key checks (6.3) are skipped
+  key-secret: dev-only-change-me # same value as the queue server
+queue-server.base-url: http://localhost:8082   # target of slot notifications (6.11)
+internal.secret: dev-internal-secret            # same value as the queue server
 ```
-- `scheduler.*`는 각 스케줄러의 주기(실제 시간 ms)와 만료 스케줄러의 한 번 처리량이다: `expiry` = 선점 만료(6.13), `recovery` = 결제 복구(6.6), `deposit` = 입금 마감(6.8), `reopen` = 취소표 오픈(6.8).
-- `strategy`, `db-backstop`, 시간 값, 좌석·등급, 결제 값은 실행 중 설정으로 들고 `/admin/reset`(6.14)으로 바꾼다.
+- `scheduler.*` are each scheduler's interval (real time, ms) and the expiry scheduler's batch size: `expiry` = hold expiry (6.12), `recovery` = payment recovery (6.6), `deposit` = deposit deadline (6.8), `reopen` = return batch opening (6.8).
+- `strategy`, `db-backstop`, time values, seats and grades, and payment values are held as runtime configuration and changed by `/admin/reset` (6.14).
 
-### 6.2 공통
-- 요청·응답은 JSON, UTF-8.
-- 에러 응답 형식 `{ "code", "message" }`.
+### 6.2 Common
+- Requests and responses are JSON, UTF-8.
+- Error response format `{ "code", "message" }`.
 
-| code | HTTP | 의미 |
+| code | HTTP | Meaning |
 |---|---|---|
-| VALIDATION_FAILED | 400 | 요청 형식 오류 |
-| KEY_INVALID | 403 | 입장키 형식·서명·runEpoch·userId 불일치 |
-| KEY_EXPIRED | 403 | 입장키 만료 (6.3의 예외 제외) |
-| KEY_REVOKED | 403 | 구매를 끝낸 입장키 |
-| SEAT_NOT_FOUND | 404 | 없는 좌석 |
-| RESERVATION_NOT_FOUND | 404 | 없는 예약 |
-| SEAT_UNAVAILABLE | 409 | 이미 선점·판매된 좌석 (`unavailableSeatIds` 포함) |
-| USER_ALREADY_HOLDING | 409 | 이미 HELD/CONFIRMING 예약이 있음 |
-| USER_ALREADY_PURCHASED | 409 | 이미 예매함 (CONFIRMED/PENDING_DEPOSIT) |
-| RESERVATION_NOT_PAYABLE | 409 | HELD가 아님, 만료, 다른 사용자, 금액 불일치 |
-| DEPOSIT_NOT_ACCEPTABLE | 409 | 입금 불가 (상태·기한·금액) |
-| RESERVATION_NOT_CANCELABLE | 409 | 취소할 수 없는 상태 |
-| SALE_ENDED | 409 | 판매 종료 (6.10) |
-| PAYMENT_DECLINED | 402 | 결제사 승인 거절 |
-| IDEMPOTENCY_KEY_REUSED | 422 | 같은 키, 다른 내용 |
-| PG_UNAVAILABLE | 502 | 결제사 호출 실패 (checkout·취소) |
+| VALIDATION_FAILED | 400 | Malformed request |
+| KEY_INVALID | 403 | Admission key format, signature, runEpoch, or userId mismatch |
+| KEY_EXPIRED | 403 | Admission key expired (except for the exception in 6.3) |
+| KEY_REVOKED | 403 | Admission key whose purchase is finished |
+| SEAT_NOT_FOUND | 404 | Seat does not exist |
+| RESERVATION_NOT_FOUND | 404 | Reservation does not exist |
+| SEAT_UNAVAILABLE | 409 | Seat already held or sold (includes `unavailableSeatIds`) |
+| USER_ALREADY_HOLDING | 409 | User already has a HELD/CONFIRMING reservation |
+| USER_ALREADY_PURCHASED | 409 | User already booked (CONFIRMED/PENDING_DEPOSIT) |
+| RESERVATION_NOT_PAYABLE | 409 | Not HELD, expired, another user, or amount mismatch |
+| DEPOSIT_NOT_ACCEPTABLE | 409 | Deposit not accepted (state, deadline, or amount) |
+| RESERVATION_NOT_CANCELABLE | 409 | State cannot be canceled |
+| SALE_ENDED | 409 | Sale has ended (6.10) |
+| PAYMENT_DECLINED | 402 | Payment gateway declined approval |
+| IDEMPOTENCY_KEY_REUSED | 422 | Same key, different content |
+| PG_UNAVAILABLE | 502 | Payment gateway call failed (checkout, cancellation) |
 
-### 6.3 입장키 검사
-- 대상: `GET /seats`, `POST /holds`, `POST /holds/{id}/*`, `POST /payments/confirm`.
-  (`POST /deposits/{id}/pay`, `POST /reservations/{id}/cancel`, `GET /reservations/{id}`는 검사하지 않는다.)
-- 헤더 `X-Admission-Key` (형식 7.3).
+### 6.3 Admission key check
+- Applies to: `GET /seats`, `POST /holds`, `POST /holds/{id}/*`, `POST /payments/confirm`.
+  (`POST /deposits/{id}/pay`, `POST /reservations/{id}/cancel`, and `GET /reservations/{id}` are not checked.)
+- Header `X-Admission-Key` (format in 7.3).
 
-| 검사 | 실패 시 |
+| Check | On failure |
 |---|---|
-| 형식·서명 | 403 KEY_INVALID |
-| `run` = 현재 runEpoch | 403 KEY_INVALID |
-| `uid` = 요청 본문의 `userId` (`GET /seats`는 본문이 없으므로 생략) | 403 KEY_INVALID |
-| `kid`가 회수 목록에 없음 | 403 KEY_REVOKED |
-| now < `exp` | 아래 예외가 아니면 403 KEY_EXPIRED |
+| Format and signature | 403 KEY_INVALID |
+| `run` = current runEpoch | 403 KEY_INVALID |
+| `uid` = `userId` in the request body (skipped for `GET /seats`, which has no body) | 403 KEY_INVALID |
+| `kid` is not in the revoked list | 403 KEY_REVOKED |
+| now < `exp` | 403 KEY_EXPIRED unless the exception below applies |
 
-- **만료 예외 (결제 도중 보호)**: 키가 만료됐어도 그 사용자에게 HELD 또는 CONFIRMING 예약이 있으면, **그 예약에 대한** `/holds/{id}/checkout`, `/holds/{id}/deposit`, `/holds/{id}/release`, `/payments/confirm`은 통과시킨다. `GET /seats`와 새 `POST /holds`는 막는다.
-- **회수 목록**: COMPLETED 알림(6.11)을 보낸 `kid`. 메모리에 두고 reset 때 비운다.
-- 예약 서버는 입장키 검사를 위해 대기열 서버를 호출하지 않는다.
-- 서명 비교는 비교 시간으로 정보가 새지 않는 방식(상수 시간 비교)으로 한다.
-- **독립 재검증**: 검사 대상 요청이 2xx로 끝나면, 위 검사와 **따로 구현한 두 번째 검사**로 같은 규칙(서명·runEpoch·uid·만료 예외)을 다시 확인한다. 이 검사가 실패하면 `counters.acceptedInvalidKeys`를 1 늘린다 (불변식 I16). 응답은 바꾸지 않는다.
-- `admission.required = false`면 입장키 검사와 독립 재검증을 모두 하지 않는다.
+- **Expiry exception (protects payment in progress)**: even if the key has expired, when the user has a HELD or CONFIRMING reservation, `/holds/{id}/checkout`, `/holds/{id}/deposit`, `/holds/{id}/release`, and `/payments/confirm` **for that reservation** are allowed. `GET /seats` and a new `POST /holds` are blocked.
+- **Revoked list**: `kid`s for which a COMPLETED notification (6.11) was sent. Kept in memory and cleared on reset.
+- The reservation server does not call the queue server to check admission keys.
+- Compare signatures in a way that does not leak information through timing (constant-time comparison).
+- **Independent re-verification**: when a checked request ends with 2xx, re-check the same rules (signature, runEpoch, uid, expiry exception) with **a second, separately implemented check**. If this check fails, increment `counters.acceptedInvalidKeys` by 1 (invariant I16). The response is not changed.
+- When `admission.required = false`, both the admission key check and the independent re-verification are skipped.
 
-### 6.4 좌석 조회 `GET /seats`
+### 6.4 Seat query `GET /seats`
 ```json
 { "rows": 10, "cols": 10,
   "grades": [ { "name": "VIP", "rows": 1, "price": 150000 } ],
@@ -312,166 +312,166 @@ internal.secret: dev-internal-secret            # 대기열 서버와 같은 값
   "availableSeats": 0, "heldSeats": 10, "pendingDepositSeats": 4, "returnPendingSeats": 2,
   "soldOut": false, "releaseAt": null, "saleEndAt": "2026-11-01T11:20:00Z" }
 ```
-- 요약 필드 7개(`availableSeats`, `heldSeats`, `pendingDepositSeats`, `returnPendingSeats`, `soldOut`, `releaseAt`, `saleEndAt`)는 **항상** 있다.
-- `soldOut` = AVAILABLE 좌석 0개이고 HELD 좌석 0개 (PENDING_DEPOSIT·RETURN_PENDING·SOLD만 남음).
-- `releaseAt` = 열린 취소표 배치의 오픈 예정 시각, 없으면 null.
-- 일관된 한 시점의 값일 필요는 없다 (약간 오래된 값 허용).
-- 판매 종료 후에는 409 `SALE_ENDED` (6.10).
+- The 7 summary fields (`availableSeats`, `heldSeats`, `pendingDepositSeats`, `returnPendingSeats`, `soldOut`, `releaseAt`, `saleEndAt`) are **always** present.
+- `soldOut` = 0 AVAILABLE seats and 0 HELD seats (only PENDING_DEPOSIT, RETURN_PENDING, and SOLD remain).
+- `releaseAt` = scheduled open time of the open return batch, or null if none.
+- The values need not come from one consistent point in time (slightly stale values are allowed).
+- After the sale ends: 409 `SALE_ENDED` (6.10).
 
-### 6.5 선점
-**`POST /holds`** 헤더 `Idempotency-Key`(1~64자, 필수), `X-Admission-Key`
+### 6.5 Hold
+**`POST /holds`** headers `Idempotency-Key` (1–64 characters, required), `X-Admission-Key`
 ```json
 { "userId": "u-0001", "seatIds": [37, 38] }
 ```
-- `userId`: 1~64자.
-- `seatIds`: 1~`maxSeatsPerUser`개, 양수, 중복 금지. 대신 단일 `seatId` 필드도 받는다 (1개로 취급). 둘 다 있거나 둘 다 없으면 400.
-- 형식 오류는 400 `VALIDATION_FAILED`. 없는 좌석이 하나라도 있으면 404 `SEAT_NOT_FOUND`.
-- **전부 아니면 전무**: 하나라도 못 잡으면 아무것도 잡지 않고 409 `SEAT_UNAVAILABLE` + `unavailableSeatIds`(못 잡은 좌석 id 목록).
-- **잠금 순서**: 여러 좌석은 항상 좌석 id 오름차순으로 잡는다 (교착 방지).
-- 처리 순서 (한 트랜잭션)
-  1. 입장키 검사(6.3), 판매 종료 확인(6.10).
-  2. 멱등 확인: 같은 `Idempotency-Key`의 예약이 있으면, 내용(`userId`와 좌석 id 집합 — 순서 무관)이 같을 때 **처음 성공 응답과 같은 201 본문**을 돌려주고, 다르면 422 `IDEMPOTENCY_KEY_REUSED`. 새 예약은 만들지 않는다.
-  3. 같은 사용자의 선점 요청은 서로 직렬화한다 (`naive` 전략은 하지 않는다).
-  4. 사용자 확인: 예매가 있으면 409 `USER_ALREADY_PURCHASED`, HELD/CONFIRMING 예약이 있으면 409 `USER_ALREADY_HOLDING`.
-  5. 좌석 확보 (전략별 아래 표). 실패하면 못 잡은 좌석마다 `counters.holdConflicts` +1.
-  6. 판매 종료를 다시 확인한다. 잠금을 기다리는 동안 종료 시각이 지났으면 409 `SALE_ENDED`로 끝낸다 (좌석은 잡지 않은 상태로 되돌린다).
-  7. 예약 생성 (HELD, 선점 만료 시각 = now + `holdTtlSec`, 입장키 `kid`), 좌석 배정 행, 좌석의 현재 소유 예약.
-  8. 커밋 후 201, 그리고 HOLD_ACTIVE 알림 (6.11).
-- 같은 키의 동시 요청이 함께 들어와도 예약은 1건만 생긴다. 나중 요청은 2번의 규칙대로 응답한다.
-- 응답 201: `{ "reservationId", "seats": [{ "id", "label", "grade", "price" }], "totalPrice", "status": "HELD", "holdExpiresAt" }` (`seats`는 id 오름차순)
+- `userId`: 1–64 characters.
+- `seatIds`: 1 to `maxSeatsPerUser` items, positive, no duplicates. A single `seatId` field is also accepted instead (treated as one seat). Both present or both missing → 400.
+- Malformed request → 400 `VALIDATION_FAILED`. If any seat does not exist → 404 `SEAT_NOT_FOUND`.
+- **All or nothing**: if any seat cannot be acquired, acquire none and return 409 `SEAT_UNAVAILABLE` with `unavailableSeatIds` (the ids that could not be acquired).
+- **Lock order**: multiple seats are always acquired in ascending seat id order (deadlock prevention).
+- Processing order (one transaction)
+  1. Admission key check (6.3), sale end check (6.10).
+  2. Idempotency check: if a reservation with the same `Idempotency-Key` exists, return **the same 201 body as the first successful response** when the content (`userId` and the set of seat ids, order-insensitive) is the same, otherwise 422 `IDEMPOTENCY_KEY_REUSED`. No new reservation is created.
+  3. Serialize hold requests from the same user (not done for the `naive` strategy).
+  4. User check: if the user has a booking → 409 `USER_ALREADY_PURCHASED`; if the user has a HELD/CONFIRMING reservation → 409 `USER_ALREADY_HOLDING`.
+  5. Acquire seats (per strategy, table below). On failure, increment `counters.holdConflicts` by 1 for each seat not acquired.
+  6. Check sale end again. If the end time passed while waiting for locks, finish with 409 `SALE_ENDED` (seats are left unacquired).
+  7. Create the reservation (HELD, hold expiry time = now + `holdTtlSec`, admission key `kid`), the seat assignment rows, and the seats' current owning reservation.
+  8. After commit, 201, then a HOLD_ACTIVE notification (6.11).
+- Even if concurrent requests with the same key arrive together, only one reservation is created. Later requests are answered by the rule in step 2.
+- 201 response: `{ "reservationId", "seats": [{ "id", "label", "grade", "price" }], "totalPrice", "status": "HELD", "holdExpiresAt" }` (`seats` in ascending id order)
 
-| 전략 | 좌석 확보 방법 |
+| Strategy | How seats are acquired |
 |---|---|
-| conditional | 상태가 AVAILABLE인 좌석만 HELD로 바꾸는 **조건부 갱신 한 번**으로 확인과 변경을 함께 한다. 바뀐 좌석 수가 요청 수와 다르면 실패 |
-| pessimistic | 요청 좌석의 행을 id 순으로 **잠근 뒤** 전부 AVAILABLE일 때만 바꾼다 |
-| optimistic | 좌석마다 읽어 둔 `version`과 같을 때만 바꾸는 갱신. 하나라도 실패하면 전체 실패. 재시도 없음 |
-| naive | 잠금 없이 상태를 읽고, AVAILABLE이면 조건 없이 바꾼다. 사용자 직렬화(3번)도 하지 않는다. **비교용** (5.2) |
+| conditional | A **single conditional update** that changes only AVAILABLE seats to HELD does the check and the change together. Fails if the number of changed seats differs from the number requested |
+| pessimistic | **Lock** the requested seat rows in id order, then change them only if all are AVAILABLE |
+| optimistic | Per seat, an update that applies only if `version` equals the value read earlier. If any fails, the whole hold fails. No retry |
+| naive | Read status without locking, and if AVAILABLE, change it without a condition. No per-user serialization (step 3) either. **For comparison** (5.2) |
 
 **`POST /holds/{id}/release`** `{ "userId" }`
-- 없는 예약 404 `RESERVATION_NOT_FOUND`, 다른 사용자 409 `RESERVATION_NOT_PAYABLE`.
-- HELD면 RELEASED + 좌석 즉시 반환 → 200 `{ "reservationId", "status": "RELEASED" }`.
-- 이미 HELD가 아니면 아무것도 바꾸지 않고 200으로 현재 상태를 돌려준다 (멱등).
+- Reservation does not exist → 404 `RESERVATION_NOT_FOUND`; another user → 409 `RESERVATION_NOT_PAYABLE`.
+- If HELD: RELEASED and seats returned immediately → 200 `{ "reservationId", "status": "RELEASED" }`.
+- If already not HELD: change nothing and return 200 with the current status (idempotent).
 
-### 6.6 카드 결제 (2단계)
+### 6.6 Card payment (two-step)
 ```
-사용자 ──① checkout──▶ 예약 서버         주문(orderId, 금액) 생성
-사용자 ──② 카드 인증──▶ 결제사           paymentKey 발급 (출금 없음)
-사용자 ──③ confirm───▶ 예약 서버 ──④ 확인 후 승인──▶ 결제사   이때 출금
+User ──① checkout──────▶ Reservation server     create order (orderId, amount)
+User ──② card auth─────▶ Payment gateway        paymentKey issued (no charge)
+User ──③ confirm───────▶ Reservation server ──④ check, then approve──▶ Payment gateway   charged here
 ```
 **① `POST /holds/{id}/checkout`** `{ "userId" }`
-- 예약을 잠그고, 사용자 불일치·HELD 아님·만료면 409 `RESERVATION_NOT_PAYABLE`.
-- 결제가 이미 있으면 그대로, 없으면 새로 만든다 (REQUESTED, 금액 = 좌석 가격 합). 결제사는 호출하지 않는다.
+- Lock the reservation; user mismatch, not HELD, or expired → 409 `RESERVATION_NOT_PAYABLE`.
+- If a payment exists, return it; otherwise create one (REQUESTED, amount = sum of seat prices). The payment gateway is not called.
 - 200 `{ "orderId", "amount" }`.
 
-**② 카드 인증**: 사용자가 결제사 `POST /auth`를 직접 호출한다 (8장).
+**② Card authorization**: the user calls the payment gateway `POST /auth` directly (section 8).
 
 **③ `POST /payments/confirm`** `{ "userId", "orderId", "paymentKey", "amount" }`
-1. (트랜잭션 A) 결제와 예약을 잠근다. 다음 중 하나면 409 `RESERVATION_NOT_PAYABLE`이고 **결제사 승인을 호출하지 않는다**: 사용자 불일치, 예약이 HELD 아님, 선점 만료 시각 지남, 금액 불일치, 결제가 REQUESTED 아님. 통과하면 예약 CONFIRMING, 승인 기한 기록, `payment_key`와 `payment_method = CARD` 저장. 커밋.
-2. (트랜잭션 밖) 결제사 `POST /payments/confirm`.
-3. (트랜잭션 B) 결과 반영
-   - DONE → 결제 APPROVED, 예약 CONFIRMED, 좌석 SOLD(조건부), COMPLETED 알림 → **200** `{ "status": "CONFIRMED" }`
-   - 4xx 거절 → 결제 FAILED, 예약 PAYMENT_FAILED, 좌석 즉시 반환 → **402** `PAYMENT_DECLINED`
-   - 타임아웃·5xx·연결 실패 → 결제사 `GET /payments/{paymentKey}` 1회
-     - DONE → 성공 처리 → 200
-     - CANCELED → 결제 CANCELED, 예약 PAYMENT_FAILED, 좌석 반환 → 402
-     - 404 → 결제 FAILED, 예약 PAYMENT_FAILED, 좌석 반환 → 402
-     - AUTHORIZED / DECLINED → 망취소 `POST /payments/{key}/cancel`: 성공하면 결제 CANCELED, 예약 PAYMENT_FAILED, 좌석 반환 → 402 / 실패하면 CONFIRMING 유지 → **202** `{ "status": "CONFIRMING" }`
-     - 조회 실패 → CONFIRMING 유지 → **202** `{ "status": "CONFIRMING" }` (사용자는 `GET /reservations/{id}`로 결과를 확인)
-- 없는 주문(`orderId`)도 409 `RESERVATION_NOT_PAYABLE`이다.
+1. (Transaction A) Lock the payment and the reservation. In any of the following cases return 409 `RESERVATION_NOT_PAYABLE` and **do not call payment gateway approval**: user mismatch, reservation not HELD, hold expiry time passed, amount mismatch, payment not REQUESTED. Otherwise set the reservation to CONFIRMING, record the approval deadline, store `payment_key` and `payment_method = CARD`. Commit.
+2. (Outside a transaction) Payment gateway `POST /payments/confirm`.
+3. (Transaction B) Apply the result
+   - DONE → payment APPROVED, reservation CONFIRMED, seats SOLD (conditional), COMPLETED notification → **200** `{ "status": "CONFIRMED" }`
+   - 4xx decline → payment FAILED, reservation PAYMENT_FAILED, seats returned immediately → **402** `PAYMENT_DECLINED`
+   - Timeout, 5xx, or connection failure → payment gateway `GET /payments/{paymentKey}` once
+     - DONE → success handling → 200
+     - CANCELED → payment CANCELED, reservation PAYMENT_FAILED, seats returned → 402
+     - 404 → payment FAILED, reservation PAYMENT_FAILED, seats returned → 402
+     - AUTHORIZED / DECLINED → reversal `POST /payments/{key}/cancel`: on success payment CANCELED, reservation PAYMENT_FAILED, seats returned → 402 / on failure keep CONFIRMING → **202** `{ "status": "CONFIRMING" }`
+     - Query fails → keep CONFIRMING → **202** `{ "status": "CONFIRMING" }` (the user checks the result with `GET /reservations/{id}`)
+- An unknown order (`orderId`) is also 409 `RESERVATION_NOT_PAYABLE`.
 
-**복구 스케줄러** (`recovery-interval-ms`): 대상 = CONFIRMING이고 승인 기한 ≤ now인 예약. 예약마다 **항상 결제사 상태 조회부터** 다시 한다.
+**Recovery scheduler** (`recovery-interval-ms`): targets = reservations that are CONFIRMING with approval deadline ≤ now. For each reservation, **always start again with a payment gateway status query**.
 
-| 조회 결과 | 처리 |
+| Query result | Handling |
 |---|---|
-| DONE | 성공 처리 (결제 APPROVED, 예약 CONFIRMED, 좌석 SOLD, COMPLETED 알림과 kid 회수) |
-| CANCELED / 404 | 결제 CANCELED(404면 FAILED), 예약 PAYMENT_FAILED, 좌석 반환, 필요하면 HOLD_CLEARED 알림 |
-| AUTHORIZED / DECLINED | 망취소 → 성공하면 위와 같이 실패 처리, 실패하면 CONFIRMING 유지 |
-| 조회 실패 | CONFIRMING 유지, 다음 주기에 다시 |
-- 재시도 횟수 제한은 없다. 시도마다 `counters.recoveryAttempts` +1, 결론을 내면 `counters.recovered` +1.
+| DONE | Success handling (payment APPROVED, reservation CONFIRMED, seats SOLD, COMPLETED notification and kid revoked) |
+| CANCELED / 404 | Payment CANCELED (FAILED for 404), reservation PAYMENT_FAILED, seats returned, HOLD_CLEARED notification when applicable |
+| AUTHORIZED / DECLINED | Reversal → on success, failure handling as above; on failure keep CONFIRMING |
+| Query fails | Keep CONFIRMING, try again next run |
+- No limit on retries. Increment `counters.recoveryAttempts` on each attempt and `counters.recovered` when a reservation is resolved.
 
-### 6.7 입금 대기·입금
+### 6.7 Pending deposit and deposit
 **`POST /holds/{id}/deposit`** `{ "userId" }`
-- HELD이고 만료 전이며 사용자가 일치해야 한다. 아니면 409 `RESERVATION_NOT_PAYABLE`.
-- 예약 PENDING_DEPOSIT, `payment_method = DEPOSIT`, 입금 기한 = now + `depositDeadlineSec`. 좌석 PENDING_DEPOSIT. COMPLETED 알림 (자리 반납).
-- 200 `{ "status": "PENDING_DEPOSIT", "depositDeadline", "amount" }`. 가상계좌는 흉내만 낸다 (결제사 호출 없음).
+- Must be HELD, not expired, and the user must match. Otherwise 409 `RESERVATION_NOT_PAYABLE`.
+- Reservation PENDING_DEPOSIT, `payment_method = DEPOSIT`, deposit deadline = now + `depositDeadlineSec`. Seats PENDING_DEPOSIT. COMPLETED notification (slot released).
+- 200 `{ "status": "PENDING_DEPOSIT", "depositDeadline", "amount" }`. The virtual account is only simulated (no payment gateway call).
 
-**`POST /deposits/{reservationId}/pay`** `{ "userId", "amount" }` (은행 역할, 입장키 검사 없음)
-- PENDING_DEPOSIT, now < 입금 기한, 사용자·금액 일치 → CONFIRMED, 좌석 SOLD → 200 `{ "status": "CONFIRMED" }`.
-- 그 외 409 `DEPOSIT_NOT_ACCEPTABLE`. 없는 예약 404.
+**`POST /deposits/{reservationId}/pay`** `{ "userId", "amount" }` (acts as the bank, no admission key check)
+- PENDING_DEPOSIT, now < deposit deadline, user and amount match → CONFIRMED, seats SOLD → 200 `{ "status": "CONFIRMED" }`.
+- Otherwise 409 `DEPOSIT_NOT_ACCEPTABLE`. Unknown reservation → 404.
 
-### 6.8 입금 마감 · 취소표 배치
-- **입금 마감 스케줄러** (`deposit-interval-ms`): PENDING_DEPOSIT이고 입금 기한 ≤ now인 예약 → DEPOSIT_EXPIRED, 좌석 RETURN_PENDING, 배치 편입.
-  - 열린 배치가 없으면 `release_at = now + returnDelaySec`인 배치를 새로 만들고, 있으면 그 배치에 합류한다 (첫 미입금 기준으로 카운트다운. 합류해도 `release_at`은 바뀌지 않는다).
-  - 좌석의 `release_batch_id`를 그 배치로, 배치의 `seat_count`를 늘린다.
-  - 판매 종료 처리(6.10)가 끝난 뒤의 미입금 좌석은 배치에 넣지 않고 즉시 AVAILABLE로 되돌린다.
-- **취소표 오픈 스케줄러** (`reopen-interval-ms`): `release_at ≤ now`인 열린 배치마다 **한 트랜잭션에서** 그 배치의 RETURN_PENDING 좌석을 전부 AVAILABLE로 바꾸고 `release_batch_id`를 비운 뒤, 배치를 `released = true`, `released_at = now`로 닫는다. `counters.reopenCount` +1, `counters.reopenSeats` + 좌석 수.
+### 6.8 Deposit deadline and return batches
+- **Deposit deadline scheduler** (`deposit-interval-ms`): reservations that are PENDING_DEPOSIT with deposit deadline ≤ now → DEPOSIT_EXPIRED, seats RETURN_PENDING, added to a batch.
+  - If no batch is open, create a new batch with `release_at = now + returnDelaySec`; if one is open, join it (the countdown starts from the first unpaid reservation; joining does not change `release_at`).
+  - Set the seats' `release_batch_id` to that batch and increase the batch's `seat_count`.
+  - Unpaid seats after sale end processing (6.10) is done are not added to a batch; they go back to AVAILABLE immediately.
+- **Return batch opening scheduler** (`reopen-interval-ms`): for each open batch with `release_at ≤ now`, **in one transaction**, change all RETURN_PENDING seats of the batch to AVAILABLE, clear their `release_batch_id`, then close the batch with `released = true`, `released_at = now`. `counters.reopenCount` +1, `counters.reopenSeats` + number of seats.
 
-### 6.9 예매 취소·조회
-**`POST /reservations/{id}/cancel`** `{ "userId" }` (입장키 검사 없음)
-- 사용자 불일치는 409 `RESERVATION_NOT_CANCELABLE`, 없는 예약 404.
-- CONFIRMED + CARD: 결제사 `POST /payments/{key}/cancel` → 성공하면 결제 CANCELED, 예약 CANCELED, 좌석 즉시 반환 → 200 / 결제사 호출 실패면 502 `PG_UNAVAILABLE`, 상태 그대로.
-- CONFIRMED + DEPOSIT, PENDING_DEPOSIT: 예약 CANCELED, 좌석 즉시 반환 → 200.
-- 200 본문 `{ "reservationId", "status": "CANCELED" }`.
-- 그 외 상태: 409 `RESERVATION_NOT_CANCELABLE`.
+### 6.9 Booking cancellation and lookup
+**`POST /reservations/{id}/cancel`** `{ "userId" }` (no admission key check)
+- User mismatch → 409 `RESERVATION_NOT_CANCELABLE`; unknown reservation → 404.
+- CONFIRMED + CARD: payment gateway `POST /payments/{key}/cancel` → on success payment CANCELED, reservation CANCELED, seats returned immediately → 200 / if the payment gateway call fails, 502 `PG_UNAVAILABLE` and nothing changes.
+- CONFIRMED + DEPOSIT, or PENDING_DEPOSIT: reservation CANCELED, seats returned immediately → 200.
+- 200 body `{ "reservationId", "status": "CANCELED" }`.
+- Any other state: 409 `RESERVATION_NOT_CANCELABLE`.
 
-**`GET /reservations/{id}`** → `{ "reservationId", "seatId", "label", "grade", "seats": [{ "id", "label", "grade", "price" }], "userId", "status", "holdExpiresAt", "paymentMethod", "depositDeadline", "payment": { "orderId", "status" } | null }` (`seatId`·`label`·`grade`는 대표 좌석). 없는 예약 404.
+**`GET /reservations/{id}`** → `{ "reservationId", "seatId", "label", "grade", "seats": [{ "id", "label", "grade", "price" }], "userId", "status", "holdExpiresAt", "paymentMethod", "depositDeadline", "payment": { "orderId", "status" } | null }` (`seatId`, `label`, `grade` are the representative seat's). Unknown reservation → 404.
 
-### 6.10 판매 종료
-- 판매 기간: `/admin/reset` 때 정한다 (6.14). 저장된 판매 기간이 없는 상태로 기동하면 기동 시각부터 `saleDurationSec` 동안으로 정해 저장한다. 저장된 판매 기간이 있으면 재시작해도 그대로 쓴다.
-- now ≥ `saleEndAt`이면
-  - `GET /seats`, 새 `POST /holds` → 409 `SALE_ENDED` (종료 처리 스케줄러가 돌기 전이라도).
-  - 이미 있는 예약의 checkout·deposit·release·confirm·입금·취소·조회는 각자 규칙대로 계속 처리한다.
-- **판매 종료 처리** (스케줄러, 1초 주기, 판매 기간마다 한 번만): 한 트랜잭션에서
-  - HELD 예약 전부 → EXPIRED, 좌석 즉시 반환, 해당 사용자에게 HOLD_CLEARED 알림.
-  - 열린 취소표 배치의 좌석은 오픈 이벤트 없이 AVAILABLE로 되돌리고 배치를 닫는다 (`reopenCount`·`reopenSeats`는 늘리지 않는다).
-  - 종료 처리를 마친 것을 기록한다.
-- 종료 처리가 끝난 뒤에는 HELD 예약이 남아 있으면 안 된다 (I14). 종료 시각 근처에 처리 중이던 선점은 6.5의 6번에서 거절되거나 종료 처리에서 만료된다.
-- CONFIRMING·PENDING_DEPOSIT은 각자 규칙대로 결론까지 진행한다 (복구·입금 마감 계속).
-- 대기 토큰의 종료는 대기열 서버가 한다 (7.6).
+### 6.10 Sale end
+- Sale period: set on `/admin/reset` (6.14). When the server starts with no stored sale period, it sets the period to `saleDurationSec` starting at startup and stores it. If a stored sale period exists, it is kept across restarts.
+- When now ≥ `saleEndAt`:
+  - `GET /seats` and a new `POST /holds` → 409 `SALE_ENDED` (even before the sale end scheduler runs).
+  - Checkout, deposit, release, confirm, deposit payment, cancellation, and lookup for existing reservations continue under their own rules.
+- **Sale end processing** (scheduler, every 1 second, once per sale period): in one transaction
+  - All HELD reservations → EXPIRED, seats returned immediately, HOLD_CLEARED notification for the affected users.
+  - Seats of the open return batch go back to AVAILABLE without an open event, and the batch is closed (`reopenCount` and `reopenSeats` are not incremented).
+  - Record that end processing is done.
+- After end processing, no HELD reservation may remain (I14). A hold being processed near the end time is either rejected in step 6 of 6.5 or expired by end processing.
+- CONFIRMING and PENDING_DEPOSIT reservations proceed to their conclusion under their own rules (recovery and deposit deadline continue).
+- The queue server closes queue tokens (7.6).
 
-### 6.11 대기열 서버로 알림
-- 예약이 생기거나 끝나는 지점에서 대기열 서버 `POST /internal/slots/{kid}/events`(7.5)로 보낸다. 요청 처리 트랜잭션이 **커밋된 뒤** 보내며, 요청 응답을 기다리게 하지 않는다 (비동기).
-- 입장키 검사를 꺼서 `kid`가 없는 예약은 알림을 보내지 않는다.
+### 6.11 Notifications to the queue server
+- Sent to the queue server `POST /internal/slots/{kid}/events` (7.5) where reservations are created or end. Send them **after** the request transaction commits, without making the request wait for them (asynchronous).
+- Reservations without a `kid` (admission key checks disabled) produce no notifications.
 
-| 사건 | 보내는 이벤트 |
+| Event | Notification sent |
 |---|---|
-| 선점 성공 | HOLD_ACTIVE |
-| 그 사용자의 HELD/CONFIRMING 예약이 모두 끝남 (해제·만료·결제 실패·판매 종료. 요청 밖에서 일어난 것 포함) | HOLD_CLEARED |
-| 카드 CONFIRMED (요청 안이든 복구 스케줄러든), 입금 대기 신청 | COMPLETED, 그리고 그 `kid`를 회수 목록에 추가 |
-| `soldOut` 값이 바뀜, 그리고 5초마다 | `POST /internal/sale-state` `{ soldOut, releaseAt }` |
+| Hold succeeds | HOLD_ACTIVE |
+| All of the user's HELD/CONFIRMING reservations have ended (release, expiry, payment failure, sale end; including those outside a request) | HOLD_CLEARED |
+| Card CONFIRMED (in the request or by the recovery scheduler), pending deposit chosen | COMPLETED, and add the `kid` to the revoked list |
+| `soldOut` changes, and every 5 seconds | `POST /internal/sale-state` `{ soldOut, releaseAt }` |
 
-- 이벤트의 `at`은 사건이 일어난 시각(서버 시계)이다. 재시도한 시각이 아니다.
-- 실패하면 재시도 3회 (실제 시간 1초, 2초, 4초 뒤). 그래도 실패하면 버리고 `counters.slotNotifyDropped` +1, `droppedNotifications`에 `{ kid, type, at }`을 남긴다 (스냅샷에 포함, reset 때 비움).
-- 알림이 실패해도 원래 요청의 결과는 바뀌지 않는다.
+- The event's `at` is the time the event happened (server clock), not the retry time.
+- On failure, retry 3 times (after 1, 2, and 4 seconds of real time). If it still fails, drop it, increment `counters.slotNotifyDropped`, and record `{ kid, type, at }` in `droppedNotifications` (included in the snapshot, cleared on reset).
+- A failed notification does not change the result of the original request.
 
-### 6.12 선점 만료 스케줄러 (`expiry-interval-ms`)
-- HELD이고 선점 만료 시각 ≤ now인 예약을 만료 시각이 이른 순으로 최대 `expiry-batch-size`건씩 처리한다: EXPIRED, 좌석 조건부 반환, `released_at` 기록, HOLD_CLEARED 알림, `counters.expiredByScheduler` +1.
-- 다른 처리가 잡고 있는 예약은 기다리지 않고 건너뛰어 다음 주기에 다시 본다.
-- CONFIRMING은 대상이 아니다.
-- 한 번에 `expiry-batch-size`건을 꽉 채워 처리했으면 같은 주기에 이어서 반복한다.
+### 6.12 Hold expiry scheduler (`expiry-interval-ms`)
+- Process reservations that are HELD with hold expiry time ≤ now, earliest expiry first, up to `expiry-batch-size` at a time: EXPIRED, conditional seat return, record `released_at`, HOLD_CLEARED notification, `counters.expiredByScheduler` +1.
+- Reservations held by another operation are skipped without waiting and checked again on the next run.
+- CONFIRMING reservations are not targets.
+- If a run processed a full `expiry-batch-size`, repeat within the same run.
 
-### 6.13 카운터
-메모리에 두고 reset 때 0으로 한다. 이름과 증가 시점:
+### 6.13 Counters
+Kept in memory and reset to 0 on reset. Names and when they increase:
 
-| 이름 | 증가 시점 |
+| Name | Increases when |
 |---|---|
-| `holdAttempts` | `POST /holds`가 형식 검사를 통과할 때마다 (멱등 재요청 포함) |
-| `holdSuccess` | 새 예약을 만들었을 때 |
-| `holdConflicts` | 좌석 확보 실패 시 못 잡은 좌석마다 |
-| `confirms` | 카드 결제가 CONFIRMED가 됐을 때 (요청 안, 복구 모두) |
-| `declines` | 결제사 승인 거절(402)일 때 |
-| `notPayable` | `RESERVATION_NOT_PAYABLE` 응답마다 |
-| `expiredByScheduler` | 선점 만료 스케줄러가 만료시킨 예약마다 |
+| `holdAttempts` | each `POST /holds` that passes format validation (including idempotent repeats) |
+| `holdSuccess` | a new reservation is created |
+| `holdConflicts` | per seat not acquired when acquisition fails |
+| `confirms` | a card payment becomes CONFIRMED (in the request or in recovery) |
+| `declines` | the payment gateway declines approval (402) |
+| `notPayable` | each `RESERVATION_NOT_PAYABLE` response |
+| `expiredByScheduler` | per reservation expired by the hold expiry scheduler |
 | `recoveryAttempts`, `recovered` | 6.6 |
-| `immediateReturns` | 좌석을 즉시 반환할 때마다 좌석 수만큼 |
-| `userCancels` | 예매 취소 성공마다 |
-| `depositsRequested`, `depositsPaid`, `depositsExpired` | 입금 대기 신청, 입금 성공, 입금 마감 |
+| `immediateReturns` | by the number of seats, each time seats are returned immediately |
+| `userCancels` | each successful booking cancellation |
+| `depositsRequested`, `depositsPaid`, `depositsExpired` | pending deposit chosen, deposit paid, deposit deadline passed |
 | `reopenCount`, `reopenSeats` | 6.8 |
 | `slotNotifyDropped` | 6.11 |
-| `acceptedInvalidKeys` | 6.3 독립 재검증 실패 |
+| `acceptedInvalidKeys` | 6.3 independent re-verification failed |
 
-### 6.14 관리 API
-**`POST /admin/reset`** (트래픽이 없을 때만 부른다)
+### 6.14 Admin API
+**`POST /admin/reset`** (call only when there is no traffic)
 ```json
 { "rows": 10, "cols": 10, "grades": [ ... ],
   "strategy": "conditional", "dbBackstop": true,
@@ -479,11 +479,11 @@ internal.secret: dev-internal-secret            # 대기열 서버와 같은 값
   "depositDeadlineSec": 60, "returnDelaySec": 30, "saleDurationSec": 1200,
   "anchorAt": "...", "saleEndAt": "...", "runEpoch": "..." }
 ```
-- 모든 필드 선택. 빠진 필드는 현재 값을 유지한다. `grades`의 행 수 합 ≠ `rows`, 알 수 없는 전략, 0 이하의 시간·좌석 값은 400.
-- `anchorAt`: 3.1대로 서버 시계 기준을 새로 잡는다.
-- 판매 기간: 시작 = (새 기준의) now, 종료 = `saleEndAt`이 오면 그 값, 없으면 now + `saleDurationSec`.
-- `runEpoch`: 입장키 검사에 쓸 실행 식별자. 없으면 새 무작위 값.
-- 처리: 모든 테이블 비우기 → 좌석 다시 만들기 → backstop 적용 → 회수 목록·알림 대기열·`droppedNotifications`·카운터 초기화 → 200 `{ "config" }`.
+- Every field is optional. Missing fields keep their current values. Sum of `grades` rows ≠ `rows`, an unknown strategy, or time or seat values of 0 or less → 400.
+- `anchorAt`: reset the server clock base as in 3.1.
+- Sale period: start = now (on the new base), end = `saleEndAt` if given, otherwise now + `saleDurationSec`.
+- `runEpoch`: run identifier used by admission key checks. If missing, a new random value.
+- Processing: clear all tables → recreate seats → apply backstop → clear the revoked list, the notification queue, `droppedNotifications`, and counters → 200 `{ "config" }`.
 
 **`GET /admin/stats`**
 ```json
@@ -494,100 +494,100 @@ internal.secret: dev-internal-secret            # 대기열 서버와 같은 값
                     "PENDING_DEPOSIT": 0, "DEPOSIT_EXPIRED": 0, "CANCELED": 0 },
   "payments": { "REQUESTED": 0, "APPROVED": 0, "FAILED": 0, "CANCELED": 0 },
   "releaseBatches": { "open": 1, "nextReleaseAt": "...|null", "totalReleased": 3 },
-  "counters": { ... 6.13의 전부 ... } }
+  "counters": { ... all of 6.13 ... } }
 ```
-- 상태별 개수는 DB 기준, 값이 0인 상태도 빠짐없이 넣는다.
+- Counts by state come from the DB; include every state, even when its count is 0.
 
-**`GET /admin/snapshot`** (불변식 확인용)
+**`GET /admin/snapshot`** (for invariant checks)
 ```json
 { "serverTime": "...", "runEpoch": "...",
   "seats": [ ... ], "reservations": [ ... ], "reservation_seats": [ ... ], "payments": [ ... ], "release_batches": [ ... ],
   "counters": { ... }, "droppedNotifications": [ { "kid", "type", "at" } ] }
 ```
-- 다섯 테이블의 **전체 행**을 5.1의 컬럼 이름 그대로 담는다. 한 시점의 일관된 상태여야 한다.
+- Contains **all rows** of the five tables, with the column names from 5.1. Must be a consistent state at a single point in time.
 
-**시계**: 3.2.
+**Clock**: 3.2.
 
 ---
 
-## 7. 대기열 서버 (:8082)
+## 7. Queue server (:8082)
 
-### 7.1 상태 (메모리, 재시작하면 사라진다)
-| 항목 | 내용 |
+### 7.1 State (in memory, lost on restart)
+| Item | Content |
 |---|---|
-| 대기 토큰 | `{ tokenId, userId, seq, status, createdAt, admittedAt, endedAt, endReason }`. 끝난 토큰도 reset 전까지 보관 |
-| 입장 자리(slot) | ADMITTED 토큰마다 `{ keyId, userId, admittedAt, expiresAt, busy, busySince, lastEventAt }` |
-| 사용자 인덱스 | userId → 활성 토큰 (WAITING/ADMITTED는 사용자당 1개) |
-| 입장 기록 | 입장 주기마다 `{ tickAt, admitted, seqFrom, seqTo, activeAfter }`. 최댓값 `activeMax`, `admittedPerTickMax` 유지 |
-| 판매 상태 | `saleEndAt`(reset), `soldOut`(예약 서버 알림) |
+| Queue tokens | `{ tokenId, userId, seq, status, createdAt, admittedAt, endedAt, endReason }`. Ended tokens are kept until reset |
+| Admission slots | Per ADMITTED token `{ keyId, userId, admittedAt, expiresAt, busy, busySince, lastEventAt }` |
+| User index | userId → active token (one WAITING/ADMITTED token per user) |
+| Admission log | Per admission run `{ tickAt, admitted, seqFrom, seqTo, activeAfter }`. Keep the maximums `activeMax` and `admittedPerTickMax` |
+| Sale state | `saleEndAt` (reset), `soldOut` (notified by the reservation server) |
 
-### 7.2 입장 규칙
-- 입장 스케줄러 (`admission-interval-ms`, 기본 1000): 입장 수 = `min(maxActive − 현재 자리 수, admitPerSec × 주기초)`, seq 오름차순. 입장하면 입장키를 발급하고 자리 `expiresAt = now + admissionTtlSec`.
-- 순번(position)은 주기마다 계산해 두고 조회 요청 때는 읽기만 한다.
-- 자리 반납: COMPLETED(예약 서버 알림), LEFT(`/queue/leave`), EXPIRED(now ≥ `expiresAt`이고 busy가 아님).
-- **만료 미룸**: busy인 자리는 `expiresAt`이 지나도 만료하지 않는다 (결제 도중 보호). 결제 중 유효시간을 넘긴 busy 자리는 **정상**이다.
-- **busy 상한**: busy여도 now ≥ `expiresAt + busyMaxExtraSec`이면 강제 만료한다. 기본 510초 (= 선점 유효시간 420 + 승인 기한 30 + 여유 60). 강제 만료마다 `expiredByBusyCap` +1, `busyCapExpirations`에 `{ kid, userId, at }`.
-- EXPIRED·LEFT·COMPLETED 사용자가 다시 진입하면 맨 뒤에 새 토큰을 받는다.
-- 대기열 서버가 대기자를 임의로 내보내는 경우는 7.6뿐이다.
+### 7.2 Admission rules
+- Admission scheduler (`admission-interval-ms`, default 1000): number admitted = `min(maxActive − current slot count, admitPerSec × interval seconds)`, in ascending seq order. On admission, issue an admission key and set the slot's `expiresAt = now + admissionTtlSec`.
+- Positions are computed every run and only read when requested.
+- Slot release: COMPLETED (reservation server notification), LEFT (`/queue/leave`), EXPIRED (now ≥ `expiresAt` and not busy).
+- **Deferred expiry**: a busy slot is not expired even after `expiresAt` (protects payment in progress). A busy slot past its lifetime during payment is **normal**.
+- **Busy cap**: even if busy, force expiry when now ≥ `expiresAt + busyMaxExtraSec`. Default 510 seconds (= hold lifetime 420 + approval deadline 30 + margin 60). Each forced expiry increments `expiredByBusyCap` and adds `{ kid, userId, at }` to `busyCapExpirations`.
+- A user whose token is EXPIRED, LEFT, or COMPLETED gets a new token at the end of the queue on re-entry.
+- Section 7.6 describes the only cases where the queue server removes waiting users on its own.
 
-### 7.3 입장키
-- 형식 `v1.<payload>.<sig>` (base64url, 패딩 없음)
-  - payload: `{ "kid": "<UUID>", "uid": "<userId>", "iat": <ms>, "exp": <ms>, "run": "<runEpoch>" }` (`iat`·`exp`는 서버 시계 기준 epoch ms, `exp` = 자리 `expiresAt`)
+### 7.3 Admission key
+- Format `v1.<payload>.<sig>` (base64url, no padding)
+  - payload: `{ "kid": "<UUID>", "uid": "<userId>", "iat": <ms>, "exp": <ms>, "run": "<runEpoch>" }` (`iat` and `exp` are epoch ms on the server clock; `exp` = the slot's `expiresAt`)
   - sig: `HMAC-SHA256(keySecret, "v1." + payload)`
-- `keySecret`은 예약 서버와 같은 값(설정). `runEpoch`는 reset마다 정하며 두 서버에 같은 값을 준다.
+- `keySecret` is the same value as on the reservation server (configuration). `runEpoch` is set on each reset, and the same value is given to both services.
 
-### 7.4 사용자 API
+### 7.4 User API
 **`POST /queue/enter`** `{ "userId" }`
-- 활성 토큰(WAITING/ADMITTED)이 있으면 그것을, 없으면 새 WAITING 토큰(또는 7.6의 경우 CLOSED 토큰)을 돌려준다.
+- Returns the active token (WAITING/ADMITTED) if one exists; otherwise a new WAITING token (or a CLOSED token in the cases of 7.6).
 - 200 `{ "token", "status", "position", "pollAfterMs", "reason" }`
 
 **`GET /queue/status?token=`**
 - WAITING: `{ "status", "position", "pollAfterMs" }`
 - ADMITTED: `{ "status", "admissionKey", "admissionExpiresAt" }`
-- 그 외: `{ "status", "reason": "SALE_ENDED" | "SOLD_OUT" | null }`
-- 없는 토큰·형식 오류 400.
-- `pollAfterMs`: position ≤ 50 → 1000, ≤ 300 → 2000, ≤ 1000 → 4000, 그 외 6000.
-- 응답에 **좌석 상황 필드는 없다.** 대기 중인 사용자는 좌석 상황을 알 수 없다.
+- Otherwise: `{ "status", "reason": "SALE_ENDED" | "SOLD_OUT" | null }`
+- Unknown or malformed token → 400.
+- `pollAfterMs`: position ≤ 50 → 1000, ≤ 300 → 2000, ≤ 1000 → 4000, otherwise 6000.
+- The response has **no seat availability fields.** Waiting users cannot see seat availability.
 
-**`POST /queue/leave`** `{ "token" }` → WAITING/ADMITTED면 LEFT, 자리 반납. 그 외 상태면 아무것도 바꾸지 않는다. 200 `{ "left": true }`. 토큰이 없으면 400.
+**`POST /queue/leave`** `{ "token" }` → if WAITING/ADMITTED, LEFT and the slot is released. In any other state nothing changes. 200 `{ "left": true }`. Missing token → 400.
 
-### 7.5 내부 API (예약 서버 → 대기열 서버)
-헤더 `X-Internal-Secret` 필수. 틀리거나 없으면 401.
+### 7.5 Internal API (reservation server → queue server)
+Header `X-Internal-Secret` required. Wrong or missing → 401.
 
 **`POST /internal/slots/{kid}/events`** `{ "type": "HOLD_ACTIVE" | "HOLD_CLEARED" | "COMPLETED", "at" }`
-| type | 처리 |
+| type | Handling |
 |---|---|
 | HOLD_ACTIVE | busy = true, `busySince = at` |
-| HOLD_CLEARED | busy = false (만료 시각이 이미 지났으면 다음 입장 주기에 EXPIRED) |
-| COMPLETED | 토큰 COMPLETED, 자리 반납 |
-- 없는 kid, 이미 끝난 자리 → 200 `{ "ignored": true }`.
-- kid마다 마지막으로 반영한 이벤트의 `at`보다 오래된 이벤트는 무시한다. COMPLETED 이후의 모든 이벤트는 무시한다. 무시하면 `slotEvents.ignored` +1.
+| HOLD_CLEARED | busy = false (if the expiry time has already passed, EXPIRED on the next admission run) |
+| COMPLETED | Token COMPLETED, slot released |
+- Unknown kid or already-ended slot → 200 `{ "ignored": true }`.
+- Per kid, ignore events whose `at` is older than the last applied event. Ignore every event after COMPLETED. Each ignored event increments `slotEvents.ignored`.
 
-**`POST /internal/sale-state`** `{ "soldOut", "releaseAt" }` → 7.6에만 쓴다.
+**`POST /internal/sale-state`** `{ "soldOut", "releaseAt" }` → used only by 7.6.
 
-| 알림 유실 | 영향 | 회복 |
+| Lost notification | Effect | Recovery |
 |---|---|---|
-| HOLD_ACTIVE | 결제 중 자리가 만료될 수 있음 (예약 서버의 만료 예외로 결제는 계속됨) | 없음 (정원이 잠깐 1 늘어남) |
-| HOLD_CLEARED | 자리가 busy로 묶임 | busy 상한 |
-| COMPLETED | 끝난 사용자가 자리를 차지 | 만료 시각 (+ busy 상한) |
-| sale-state | 매진 반영 지연 | 5초 주기 재전송 |
+| HOLD_ACTIVE | Slot may expire during payment (payment continues thanks to the reservation server's expiry exception) | None (capacity is briefly exceeded by 1) |
+| HOLD_CLEARED | Slot stays tied up as busy | Busy cap |
+| COMPLETED | A finished user keeps a slot | Expiry time (+ busy cap) |
+| sale-state | Sold-out state applied late | Resent every 5 seconds |
 
-### 7.6 판매 상태 처리
-- **판매 종료** (now ≥ `saleEndAt`): WAITING/ADMITTED 토큰 전부 CLOSED(`SALE_ENDED`), 자리 전부 반납. 이후 enter는 200 + CLOSED(`SALE_ENDED`) 토큰.
-- **`closeQueueOnSoldOut`** (기본 true):
-  - true이고 soldOut이면 **WAITING만** CLOSED(`SOLD_OUT`)로 바꾸고, 이후 enter도 CLOSED(`SOLD_OUT`) 토큰을 준다. soldOut = false가 오면 다시 접수한다.
-  - false면 매진이어도 아무도 내보내지 않는다.
-- **ADMITTED는 매진으로 닫지 않는다.** 입장한 사람의 자리는 7.2의 규칙(COMPLETED, LEFT, 만료, busy 상한)으로만 반납한다. 그래서 다시 열려도 실제 빈 자리만큼만 입장시키고, **유효한 입장키를 가진 사람 수 ≤ maxActive**가 항상 지켜진다 (입장키는 서명 토큰이라 대기열 서버가 상태를 바꿔도 `exp`까지 예약 서버에서 유효하기 때문).
-- 입장키는 회수하지 않는다. 입장한 사용자는 키 만료까지 `GET /seats`를 쓸 수 있다.
+### 7.6 Sale state handling
+- **Sale end** (now ≥ `saleEndAt`): all WAITING/ADMITTED tokens → CLOSED (`SALE_ENDED`), all slots released. After that, enter returns 200 with a CLOSED (`SALE_ENDED`) token.
+- **`closeQueueOnSoldOut`** (default true):
+  - If true and sold out, change **only WAITING** tokens to CLOSED (`SOLD_OUT`), and later enters also get a CLOSED (`SOLD_OUT`) token. When soldOut = false arrives, accept entries again.
+  - If false, nobody is removed even when sold out.
+- **ADMITTED tokens are not closed because of sold-out.** An admitted user's slot is released only by the rules in 7.2 (COMPLETED, LEFT, expiry, busy cap). So after reopening, only as many users as there are actual free slots are admitted, and **the number of people holding a valid admission key ≤ maxActive** always holds (an admission key is a signed token, so it stays valid on the reservation server until `exp` regardless of the queue server's state).
+- Admission keys are not revoked. An admitted user can use `GET /seats` until the key expires.
 
-### 7.7 관리 API
-- **`POST /admin/reset`** `{ "anchorAt", "maxActive", "admitPerSec", "admissionTtlSec", "busyMaxExtraSec", "saleEndAt", "closeQueueOnSoldOut", "runEpoch" }` (모두 선택, 빠지면 현재 값 유지. `anchorAt`은 3.1. 토큰·자리·기록·카운터를 모두 비운다) → 200 `{ "config" }`
+### 7.7 Admin API
+- **`POST /admin/reset`** `{ "anchorAt", "maxActive", "admitPerSec", "admissionTtlSec", "busyMaxExtraSec", "saleEndAt", "closeQueueOnSoldOut", "runEpoch" }` (all optional; missing fields keep current values; `anchorAt` as in 3.1; clears all tokens, slots, logs, and counters) → 200 `{ "config" }`
 - **`GET /admin/stats`** → `{ "serverTime", "WAITING", "ADMITTED", "COMPLETED", "LEFT", "EXPIRED", "CLOSED", "busy", "slotsBusyOverTtl", "counters": { "entered", "admitted", "keysIssued", "expired", "expiredByBusyCap", "closedSoldOut", "closedSaleEnded", "slotEvents": { "HOLD_ACTIVE", "HOLD_CLEARED", "COMPLETED", "ignored" } } }`
-  - `slotsBusyOverTtl` = busy이면서 now ≥ `expiresAt`인 자리 수.
+  - `slotsBusyOverTtl` = number of slots that are busy with now ≥ `expiresAt`.
 - **`GET /admin/snapshot`** → `{ "serverTime", "config", "tokens": [...], "slots": [...], "admissions": [...], "activeMax", "admittedPerTickMax", "busyCapExpirations": [...] }`
-- **시계**: 3.2.
+- **Clock**: 3.2.
 
-### 7.8 설정
+### 7.8 Configuration
 ```yaml
 server.port: 8082
 queue: { max-active: 200, admit-per-sec: 20, admission-ttl-sec: 420, busy-max-extra-sec: 510,
@@ -598,62 +598,62 @@ internal.secret: dev-internal-secret
 
 ---
 
-## 8. 모의 결제사 (mock-pg, :8081)
+## 8. Mock payment gateway (mock-pg, :8081)
 
-결제 정보는 메모리에 둔다.
+Payment data is kept in memory.
 
-- **`POST /auth`** `{ orderId, amount }` → 확률 `authFailureRate`로 400 `AUTH_FAILED`. 성공하면 결제를 AUTHORIZED로 저장하고 200 `{ paymentKey }`.
+- **`POST /auth`** `{ orderId, amount }` → with probability `authFailureRate`, 400 `AUTH_FAILED`. On success, store the payment as AUTHORIZED and return 200 `{ paymentKey }`.
 - **`POST /payments/confirm`** `{ paymentKey, orderId, amount }`
-  - 지연 U(`confirmMinMs`, `confirmMaxMs`) (실제 시간).
-  - 확률 `timeoutRate`로 응답하지 않고 `confirmMaxMs + 10000`ms 동안 붙잡아 둔다. 이때도 내부적으로 50% 확률로 승인(DONE)할지 정해 저장한다 (결과를 모르는 상황 재현).
-  - 확률 `declineRate`로 400 `INSUFFICIENT_FUNDS` (DECLINED로 저장).
-  - 키·주문·금액 불일치, 이미 처리된 결제 → 400 `INVALID_REQUEST`.
-  - 성공 200 `{ status: "DONE", approvedAt }`.
-- **`GET /payments/{key}`** → 200 `{ status }` (AUTHORIZED / DONE / DECLINED / CANCELED) 또는 404.
-- **`POST /payments/{key}/cancel`** → DONE·AUTHORIZED면 CANCELED로 바꾸고 200 `{ status }`. 그 외 상태(CANCELED, DECLINED)는 바꾸지 않고 현재 상태로 200 (멱등). 없는 키 404.
-- **관리**
-  - `GET/PUT /admin/config` `{ authFailureRate, declineRate, timeoutRate, confirmMinMs, confirmMaxMs, seed }`. 확률은 0~1, `0 ≤ confirmMinMs ≤ confirmMaxMs`가 아니면 400 `INVALID_REQUEST`. 같은 `seed`면 같은 요청 순서에 같은 무작위 결과, `seed`가 null이면 매번 다른 결과.
-  - `POST /admin/reset` → 결제·통계 초기화 (본문에 `anchorAt`이 있으면 3.1).
+  - Delay U(`confirmMinMs`, `confirmMaxMs`) (real time).
+  - With probability `timeoutRate`, do not respond and hold the request for `confirmMaxMs + 10000` ms. Even then, internally decide with 50% probability whether to approve (DONE) and store it (simulates an unknown result).
+  - With probability `declineRate`, 400 `INSUFFICIENT_FUNDS` (stored as DECLINED).
+  - Key, order, or amount mismatch, or an already processed payment → 400 `INVALID_REQUEST`.
+  - Success 200 `{ status: "DONE", approvedAt }`.
+- **`GET /payments/{key}`** → 200 `{ status }` (AUTHORIZED / DONE / DECLINED / CANCELED) or 404.
+- **`POST /payments/{key}/cancel`** → DONE or AUTHORIZED becomes CANCELED, 200 `{ status }`. Other states (CANCELED, DECLINED) are unchanged and return their current status with 200 (idempotent). Unknown key → 404.
+- **Admin**
+  - `GET/PUT /admin/config` `{ authFailureRate, declineRate, timeoutRate, confirmMinMs, confirmMaxMs, seed }`. Probabilities must be in 0–1 and `0 ≤ confirmMinMs ≤ confirmMaxMs`, otherwise 400 `INVALID_REQUEST`. The same `seed` gives the same random results for the same request order; a null `seed` gives different results each time.
+  - `POST /admin/reset` → clears payments and statistics (`anchorAt` in the body as in 3.1).
   - `GET /admin/stats` `{ serverTime, authRequests, authFailed, confirmRequests, done, declined, timedOut, canceled, confirmInflight, confirmLatency: { p50, p95, p99 } }`
-  - `GET /admin/payments` → 모든 결제 `{ paymentKey, orderId, amount, status }`.
-  - 시계: 3.2.
-- 기본 설정: `authFailureRate` 0.03, `declineRate` 0.03, `timeoutRate` 0, `confirmMinMs` 100, `confirmMaxMs` 500, `seed` null.
+  - `GET /admin/payments` → all payments `{ paymentKey, orderId, amount, status }`.
+  - Clock: 3.2.
+- Defaults: `authFailureRate` 0.03, `declineRate` 0.03, `timeoutRate` 0, `confirmMinMs` 100, `confirmMaxMs` 500, `seed` null.
 
 ---
 
-## 9. 불변식
+## 9. Invariants
 
-`/admin/snapshot`(세 서버)과 `/admin/payments`로 확인할 수 있어야 한다. "정지 상태"는 트래픽이 멈춘 뒤 `holdTtlSec + confirmDeadlineSec + 5`초가 지난 상태다.
+These must be checkable with `/admin/snapshot` (all three services) and `/admin/payments`. "Quiescent state" means `holdTtlSec + confirmDeadlineSec + 5` seconds after traffic stops.
 
-| ID | 불변식 |
+| ID | Invariant |
 |---|---|
-| I1 | 좌석 SOLD ⇔ 그 좌석을 가진(`released_at` null) CONFIRMED 예약이 정확히 1건 |
-| I2 | 좌석마다 `released_at`이 null인 `reservation_seats` 행은 최대 1개 (`naive` + backstop 끔 제외) |
-| I3 | 결제사에서 DONE(취소 안 됨)인 결제 ⇔ 예약 서버의 APPROVED 결제 + CONFIRMED 예약 (돈만 빠지고 좌석이 없는 경우 0) |
-| I4 | 사용자당 HELD/CONFIRMING 예약 최대 1건 |
-| I5 | 좌석 상태별 수의 합 = 전체 좌석. HELD ⇔ 소유 예약이 HELD/CONFIRMING, PENDING_DEPOSIT ⇔ 소유 예약이 PENDING_DEPOSIT, RETURN_PENDING ⇔ 열린 배치 소속 |
-| I6 | 정지 상태에서 HELD/CONFIRMING 예약 0 |
-| I7 | 같은 `Idempotency-Key` ⇒ 예약 1건, 같은 응답 본문 |
-| I8 | 대기열 서버: 어느 시점에도 자리 수 ≤ `maxActive`, 입장은 seq 순서, 주기당 입장 수 ≤ `admitPerSec × 주기초` |
-| I9 | 승인 직전 확인에서 만료된 예약에 대해 결제사 승인 호출 0 |
-| I10 | 한 예약의 좌석은 항상 같은 상태 |
-| I11 | 사용자당 CONFIRMED + PENDING_DEPOSIT 예약 최대 1건, 그 좌석 합 ≤ `maxSeatsPerUser` |
-| I12 | 결제사 DONE(취소 안 됨) 결제 ⇔ CARD 방식 CONFIRMED 예약. CANCELED 예약의 카드 결제는 결제사에서도 CANCELED |
-| I13 | RETURN_PENDING 좌석은 배치의 `release_at` + 2초 안에 AVAILABLE이 된다 (판매 종료 처리는 예외) |
-| I14 | 판매 종료 후: 대기열 서버의 WAITING·ADMITTED 0, 예약 서버의 HELD 0 (종료 처리 주기 이내) |
-| I15 | busy 상한 강제 만료(`busyCapExpirations`)의 각 kid에 대해 (a) 예약 서버 `droppedNotifications`에 그 kid의 HOLD_CLEARED 또는 COMPLETED가 있거나 (b) 그 시각에 그 kid의 예약이 CONFIRMING이었다. 결제 중 유효시간을 넘긴 busy 자체는 위반이 아니다 |
-| I16 | 예약 서버 `counters.acceptedInvalidKeys` = 0 |
-| I17 | 유효한 입장키(만료 전, 현재 runEpoch)를 가진 사용자 수 ≤ `maxActive` |
+| I1 | Seat SOLD ⇔ exactly one CONFIRMED reservation owns that seat (`released_at` null) |
+| I2 | At most one `reservation_seats` row with `released_at` null per seat (except `naive` with backstop off) |
+| I3 | Payment DONE (not canceled) at the payment gateway ⇔ APPROVED payment + CONFIRMED reservation on the reservation server (0 cases of money taken without a seat) |
+| I4 | At most one HELD/CONFIRMING reservation per user |
+| I5 | Sum of seats by state = total seats. HELD ⇔ owning reservation is HELD/CONFIRMING; PENDING_DEPOSIT ⇔ owning reservation is PENDING_DEPOSIT; RETURN_PENDING ⇔ belongs to the open batch |
+| I6 | 0 HELD/CONFIRMING reservations in the quiescent state |
+| I7 | Same `Idempotency-Key` ⇒ one reservation, same response body |
+| I8 | Queue server: at any time slot count ≤ `maxActive`, admission in seq order, admissions per run ≤ `admitPerSec × interval seconds` |
+| I9 | 0 payment gateway approval calls for reservations found expired in the check before approval |
+| I10 | All seats of one reservation are always in the same state |
+| I11 | At most one CONFIRMED + PENDING_DEPOSIT reservation per user, with total seats ≤ `maxSeatsPerUser` |
+| I12 | Payment gateway DONE (not canceled) payment ⇔ CONFIRMED reservation paid by CARD. Card payments of CANCELED reservations are also CANCELED at the payment gateway |
+| I13 | RETURN_PENDING seats become AVAILABLE within the batch's `release_at` + 2 seconds (except via sale end processing) |
+| I14 | After the sale ends: 0 WAITING/ADMITTED on the queue server and 0 HELD on the reservation server (within one sale end processing interval) |
+| I15 | For each kid force-expired by the busy cap (`busyCapExpirations`), either (a) the reservation server's `droppedNotifications` contains a HOLD_CLEARED or COMPLETED for that kid, or (b) that kid's reservation was CONFIRMING at that time. A busy slot past its lifetime during payment is not a violation by itself |
+| I16 | Reservation server `counters.acceptedInvalidKeys` = 0 |
+| I17 | Number of users holding a valid admission key (not expired, current runEpoch) ≤ `maxActive` |
 
 ---
 
-## 10. 구현하지 말 것
+## 10. Do not implement
 
-| 제외 |
+| Excluded |
 |---|
-| 서버 다중 인스턴스, Redis, 분산 락 |
-| 결제사 호출 재시도·백오프·서킷 브레이커 (6.6의 조회 1회 + 망취소 + 복구 스케줄러까지만) |
-| 대기열의 외부 저장소 이전, 봇·매크로 차단, 요청 수 제한, 공정성 정책(대기열 무작위화 등), 입장 속도 자동 조절 |
-| 과부하 대응 (요청 버리기, 429/503) |
-| 인증·인가, 실제 결제, 애플리케이션 Docker 이미지, 메시지 큐, Kubernetes |
-| 성능 계측·대시보드·화면 |
+| Multiple server instances, Redis, distributed locks |
+| Retries, backoff, or circuit breakers for payment gateway calls (only the single query + reversal + recovery scheduler in 6.6) |
+| Moving the queue to external storage, bot or macro blocking, request rate limiting, fairness policies (queue randomization, etc.), automatic admission rate control |
+| Overload handling (dropping requests, 429/503) |
+| Authentication and authorization, real payments, application Docker images, message queues, Kubernetes |
+| Performance metrics, dashboards, UI |
