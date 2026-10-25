@@ -20,3 +20,4 @@ out/
 .claude/settings.local.json
 *.log
 .env
+*:Zone.Identifier
