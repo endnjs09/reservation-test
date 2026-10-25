@@ -1,0 +1,22 @@
+# build
+build/
+.gradle/
+out/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# local
+.claude/settings.local.json
+*.log
+.envbuild/
+.gradle/
+out/
+.idea/
+*.iml
+.vscode/
+.claude/settings.local.json
+*.log
+.env
